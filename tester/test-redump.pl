@@ -1,6 +1,7 @@
 #!/usr/bin/perl
 use strict; use warnings;
 use Getopt::Long qw(GetOptions);
+use XML::Parser;
 Getopt::Long::Configure qw(gnu_getopt);
 
 my $runners = 1;
@@ -21,6 +22,55 @@ my $gamedir = shift @ARGV or die "No psx_game_dir provided";
 -d $gamedir or die "psx_game_dir: $gamedir does not exist";
 
 # download psx database from redump, extract, and load.
+my $parser = XML::Parser->new(Style => 'Tree');
+my $redump = $parser->parsefile('Sony - PlayStation - Datfile (10701) (2023-03-22 01-15-22).dat');
+use Data::Dumper qw(Dumper);
+
+sub GetElement {
+    my ($values) = @_;
+    scalar(@{$values}) or return undef;
+    my @newvalues = @$values;
+    my $tag = $newvalues[0];
+    if($tag =~ /^0$/) {
+        my $value = $newvalues[1];
+        splice(@newvalues, 0, 2);
+        @{$values} = @newvalues;
+        return {
+            tag => 0,
+            value => $value
+        };
+    }
+    my @nextvalues = @{$newvalues[1]};
+    my $attr = $newvalues[1][0];
+    splice(@nextvalues, 0, 1);
+    splice(@newvalues, 0, 2);
+    @{$values} = @newvalues;
+    return {
+        tag => $tag,
+        attr => $attr,
+        values => \@nextvalues
+    };
+};
+
+my %redumpgames;
+my @rcopy = @{$redump};
+my $df = GetElement(\@rcopy);
+$df->{tag} eq 'datafile' or die "should be a datafile";
+while(my $elm = GetElement($df->{values})) {
+    if($elm->{tag} eq 'game') {
+        die if (exists $redumpgames{$elm->{attr}{name}});
+        my %game;
+        while(my $gelm = GetElement($elm->{values})) {
+            if($gelm->{tag} eq 'rom') {
+                $game{$gelm->{attr}{name}} = $gelm->{attr};
+            }
+        }
+        $redumpgames{$elm->{attr}{name}} = \%game;
+    }
+}
+print Dumper(\%redumpgames);
+die;
+
 
 # divide up the games and launch the workers
 opendir(my $dh, $gamedir) or die "failed to open psx_game_dir: $gamedir";
