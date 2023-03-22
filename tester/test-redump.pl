@@ -1,10 +1,39 @@
 #!/usr/bin/perl
 use strict; use warnings;
+use Data::Dumper qw(Dumper);
+use Digest::SHA qw(sha1_hex);
 use Getopt::Long qw(GetOptions);
 use XML::Parser;
-Getopt::Long::Configure qw(gnu_getopt);
 
+use constant {
+    IT_ARRAY => 0,
+    IT_INDEX => 1,
+    IT_INDEX_NEXT => 2,
+    ELM_TAG => 0,
+    ELM_VALUE => 1,
+    ELM_VALUE_ATTR => 0,
+    ELM_VALUE_FIRST => 1
+};
+
+sub XMLIterator {
+    my ($arr) = @_;
+    return [$arr, ELM_VALUE_FIRST];
+}
+
+sub XMLIteratorGetElement {
+    my ($it) = @_;
+    my $arr = $it->[IT_ARRAY];
+    my $ind = \$it->[IT_INDEX];
+    scalar(@{$arr}) - $$ind or return undef;
+    my $tag = $arr->[$$ind + ELM_TAG];
+    my $value = $arr->[$$ind + ELM_VALUE];
+    $$ind += IT_INDEX_NEXT;
+    return [$tag, $value];
+};
+
+Getopt::Long::Configure qw(gnu_getopt);
 my $runners = 1;
+my $algo = 'sha1';
 my $usage = <<"END_USAGE";
 $0 [-h|--help] [-j|--jobs <num_jobs>] <psx_game_dir>
   -h|--help        Print this message
@@ -22,54 +51,25 @@ my $gamedir = shift @ARGV or die "No psx_game_dir provided";
 -d $gamedir or die "psx_game_dir: $gamedir does not exist";
 
 # download psx database from redump, extract, and load.
+print "parsing db into hash of games and files ...\n";
 my $parser = XML::Parser->new(Style => 'Tree');
 my $redump = $parser->parsefile('Sony - PlayStation - Datfile (10701) (2023-03-22 01-15-22).dat');
-use Data::Dumper qw(Dumper);
-
-sub GetElement {
-    my ($values) = @_;
-    scalar(@{$values}) or return undef;
-    my @newvalues = @$values;
-    my $tag = $newvalues[0];
-    if($tag =~ /^0$/) {
-        my $value = $newvalues[1];
-        splice(@newvalues, 0, 2);
-        @{$values} = @newvalues;
-        return {
-            tag => 0,
-            value => $value
-        };
-    }
-    my @nextvalues = @{$newvalues[1]};
-    my $attr = $newvalues[1][0];
-    splice(@nextvalues, 0, 1);
-    splice(@newvalues, 0, 2);
-    @{$values} = @newvalues;
-    return {
-        tag => $tag,
-        attr => $attr,
-        values => \@nextvalues
-    };
-};
-
 my %redumpgames;
-my @rcopy = @{$redump};
-my $df = GetElement(\@rcopy);
-$df->{tag} eq 'datafile' or die "should be a datafile";
-while(my $elm = GetElement($df->{values})) {
-    if($elm->{tag} eq 'game') {
-        die if (exists $redumpgames{$elm->{attr}{name}});
-        my %game;
-        while(my $gelm = GetElement($elm->{values})) {
-            if($gelm->{tag} eq 'rom') {
-                $game{$gelm->{attr}{name}} = $gelm->{attr};
-            }
-        }
-        $redumpgames{$elm->{attr}{name}} = \%game;
+$redump->[ELM_TAG] eq 'datafile' or die "should be a datafile";
+my $dfit = XMLIterator($redump->[ELM_VALUE]);
+while(my $elm = XMLIteratorGetElement($dfit)) {
+    next if($elm->[ELM_TAG] ne 'game');
+    my %game;
+    my $gameit = XMLIterator($elm->[ELM_VALUE]);
+    while(my $gelm = XMLIteratorGetElement($gameit)) {
+        next if($gelm->[ELM_TAG] ne 'rom');
+        $game{$gelm->[ELM_VALUE][ELM_VALUE_ATTR]{name}} = $gelm->[ELM_VALUE][ELM_VALUE_ATTR];
     }
+    $redumpgames{$elm->[ELM_VALUE][ELM_VALUE_ATTR]{name}} = \%game;
 }
-print Dumper(\%redumpgames);
-die;
+print "parsing db into hash of games and files ... done\n";
+#print Dumper(\%redumpgames);
+#die;
 
 
 # divide up the games and launch the workers
@@ -83,17 +83,56 @@ for(my $i = 0; $i < $runners; $i++) {
         print "runner $i: nothing to process\n";
         next;
     }
-    my @current_games = splice(@games, -1, $num_games);
+    my @current_games = splice(@games, -1 * $num_games);
     my $forkres = fork() // die "failed to fork";
     if($forkres != 0) {
         $numchildren++;
         next;
     }
     my $rc = 0;
+    GAME:
     foreach my $game (@current_games) {
         # sanity check, verify against redump before unpacking and repacking
+        if(! exists $redumpgames{$game}) {
+            print "runner $i: game: $game not found in redump database\n";
+            $rc = 1;
+            next;
+        }
+        my $gamebad;
+        my $binfile;
+        foreach my $file (keys %{$redumpgames{$game}}) {
+            my $localfile = "$gamedir/$game/$file";
+            if($localfile =~ /\.bin/) {
+                if($binfile) {
+                    print "runner $i: $game failed, multi-bin is not supported yet\n";
+                    $gamebad = 1;
+                    next;
+                }
+                $binfile = $localfile;
+            }
+            if(! -f $localfile) {
+                print "runner $i: $localfile was not found\n";
+                $gamebad = 1;
+                next;
+            }
+            open(my $fh, '<', $localfile) or die "failed to open file";
+            my $file_content = do { local $/; <$fh>};
+            close($fh);
+            my $calculated = sha1_hex($file_content);
+            my $expected = $redumpgames{$game}{$file}{sha1};
+            if($expected ne $calculated) {
+                print "runner $i: $localfile does not match redump\n";
+                print "runner $i: expected ". $expected . " got $calculated\n";
+                $gamebad = 1;
+            }
+        }
+        if($gamebad) {
+            $rc = 1;
+            next;
+        }
 
         # unpack and repack
+        my @dumpsxiso = ('dumpsxiso', '-x', 'dump/'.$game, '-s', "dump/$game.xml", $binfile);
 
         # verify repack against redump
     }
